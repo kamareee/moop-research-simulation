@@ -1,3 +1,5 @@
+# pylint: disable=missing-module-docstring,missing-class-docstring,missing-function-docstring, wrong-import-order
+
 import numpy as np
 import pickle
 from pymoo.core.problem import ElementwiseProblem
@@ -10,7 +12,7 @@ with open("sim_data.pkl", "rb") as f:
 
 class ChargingProblem(ElementwiseProblem):
     def __init__(self):
-        # Decisions per window: 0: Skip, 1: Depot, 2..F+1: Public L2, F+2..2F+1: Public DC [cite: 1435, 1487]
+        # Decisions per window: 0: Skip, 1: Depot, 2..F+1: Public L2, F+2..2F+1: Public DC
         self.n_windows = sum(len(v["dwells"]) for v in DATA["fleet"])
         super().__init__(
             n_var=self.n_windows, n_obj=2, n_constr=1, xl=0, xu=1 + 2 * DATA["F"]
@@ -45,15 +47,13 @@ class ChargingProblem(ElementwiseProblem):
                     )
                     depot_load[start:end] += p_charge
 
-                elif choice > 1:  # Public [cite: 1496, 1501, 1566]
+                elif choice > 1:  # Public Station
                     f_idx = (choice - 2) % DATA["F"]
                     c_type = "L2" if choice < 2 + DATA["F"] else "DC"
                     station = DATA["stations"][f_idx]
 
                     wait = station["wait_profile"][start]
-                    net_time = (
-                        (duration_hrs * 60) - v["detour"][f_idx] - wait
-                    )  # [cite: 1566]
+                    net_time = (duration_hrs * 60) - v["detour"][f_idx] - wait
 
                     if net_time > 0:
                         energy = min(
@@ -64,17 +64,17 @@ class ChargingProblem(ElementwiseProblem):
                         total_cost += energy * station["pi_pub"][c_type]
                         total_cost += DATA["c_d_t"] * (
                             v["detour"][f_idx] + wait
-                        )  # Detour/Wait Cost [cite: 1501]
+                        )  # Detour/Wait Cost
 
-            # Trip consumption [cite: 1590]
+            # Trip consumption
             for trip_e in v["e_trip"]:
                 if soc[i] < trip_e:
-                    total_shortfall += trip_e - soc[i]  # [cite: 1599]
+                    total_shortfall += trip_e - soc[i]
                     soc[i] = 0
                 else:
                     soc[i] -= trip_e
 
-        # Constraint: Site limit [cite: 1550]
+        # Constraint: Site limit
         site_violation = np.sum(
             np.maximum(
                 0, depot_load + DATA["p_base"] - DATA["p_pv"] - DATA["p_site_max"]
@@ -85,9 +85,9 @@ class ChargingProblem(ElementwiseProblem):
         out["G"] = [site_violation]
 
 
-# Optimization [cite: 1691, 1697]
+# Optimization
 problem = ChargingProblem()
-algorithm = NSGA2(pop_size=40)
+algorithm = NSGA2(pop_size=100)
 res = minimize(problem, algorithm, ("n_gen", 100), seed=1, verbose=True)
 
 with open("results.pkl", "wb") as f:
