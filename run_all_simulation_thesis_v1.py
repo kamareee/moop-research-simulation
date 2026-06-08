@@ -8,9 +8,12 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.colors as mcolors
 from pymoo.core.problem import ElementwiseProblem
+from pymoo.core.sampling import Sampling
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.optimize import minimize
 from pymoo.decomposition.asf import ASF
+from pymoo.indicators.hv import Hypervolume
+import csv
 
 
 # --- 1. DATA GENERATION & CACHING ---
@@ -85,7 +88,7 @@ def get_advanced_case_data(N, F_count, M, alpha):
         fleet.append(
             {
                 "bat_max": bat_max,
-                "soc_init": 0.35,
+                "soc_init": 0.30,
                 "e_trip": trips,
                 "dwells": dwells,
                 "detour": detours,
@@ -162,6 +165,10 @@ class ChargingProblem(ElementwiseProblem):
         cost, total_shortfall = 0, 0
         load, evses = np.zeros(d["T"]), np.zeros(d["T"])
         conn_occ = np.zeros((d["F"], d["T"]))
+        # Attempted occupancy: what the schedule *would* claim regardless of
+        # whether the station is available at that time. Used for plotting to
+        # expose availability violations by the uncoordinated baseline.
+        conn_occ_attempted = np.zeros((d["F"], d["T"]))
         e_depot, e_L2 = 0, 0  # charged-in energy (debug)
         e_dep_trips, e_pub_trips = 0, 0  # trip-delivered energy by source
 
@@ -200,6 +207,18 @@ class ChargingProblem(ElementwiseProblem):
                     net_min = ((end - start) * d["dt"] * 60) - v["detour"][f_idx] - wait
                     cost += d["c_d_t"] * (v["detour"][f_idx] + wait)
 
+                    # Attempted-occupancy footprint (used for reporting; recorded
+                    # whether or not the station is actually available).
+                    slot_min = d["dt"] * 60
+                    occ_start_att = min(
+                        d["T"], start + int(np.ceil(v["detour"][f_idx] / slot_min))
+                    )
+                    if net_min > 0:
+                        occ_end_att = min(
+                            d["T"], occ_start_att + int(np.ceil(net_min / slot_min))
+                        )
+                        conn_occ_attempted[f_idx, occ_start_att:occ_end_att] += 1
+
                     if net_min > 0 and is_avail:
                         energy_gained = (
                             min(st["power"] * (net_min / 60), v["bat_max"] - soc[i])
@@ -211,14 +230,10 @@ class ChargingProblem(ElementwiseProblem):
                         b_pub[i] += energy_gained
 
                         # Track connector occupancy (reporting-only)
-                        slot_min = d["dt"] * 60
-                        occ_start = min(
-                            d["T"], start + int(np.ceil(v["detour"][f_idx] / slot_min))
-                        )
                         occ_end = min(
-                            d["T"], occ_start + int(np.ceil(net_min / slot_min))
+                            d["T"], occ_start_att + int(np.ceil(net_min / slot_min))
                         )
-                        conn_occ[f_idx, occ_start:occ_end] += 1
+                        conn_occ[f_idx, occ_start_att:occ_end] += 1
 
                 # Trip after this dwell (if any)
                 if j < len(v["e_trip"]):
@@ -250,6 +265,7 @@ class ChargingProblem(ElementwiseProblem):
             "net_load": load,
             "evses": evses,
             "conn_occ": conn_occ,
+            "conn_occ_attempted": conn_occ_attempted,
             "e_depot": e_depot,
             "e_L2": e_L2,
             "e_dep": e_dep_trips,
@@ -310,9 +326,19 @@ def depot_only_chrom(data):
 
 
 def uncoord_chrom(data):
-    """All vehicles plug in at L2 station 0 every dwell."""
-    n_var = sum(len(v["dwells"]) for v in data["fleet"])
-    return np.full(n_var, 2, dtype=int)
+    """Uncoordinated baseline: each vehicle plugs in at its NEAREST public
+    station (shortest detour) at every dwell window. Models drivers acting
+    independently with no system-level coordination, so load spreads across
+    stations by proximity rather than piling onto a single station.
+
+    Gene encoding: choice = 2 + f_idx selects public station f_idx.
+    """
+    chrom = []
+    for v in data["fleet"]:
+        nearest_f = int(np.argmin(v["detour"]))  # station with shortest detour
+        for _ in range(len(v["dwells"])):
+            chrom.append(2 + nearest_f)
+    return np.array(chrom, dtype=int)
 
 
 def is_feasible(data, res):
@@ -331,12 +357,73 @@ def connector_oversubscribed(data, res):
     return c_viol > 1e-6
 
 
+class WarmStartSampling(Sampling):
+    """NSGA-II initial population seeded with the heuristic schedules.
+
+    Random init rarely produces the all-depot corner, so NSGA-II tends to
+    miss the cheap high-reliability region. Seeding a few individuals with
+    (i) the depot-greedy heuristic, (ii) an all-depot schedule, and
+    (iii) the uncoordinated schedule anchors the search at the known corners;
+    the remaining individuals are random for diversity.
+    """
+
+    def __init__(self, data):
+        super().__init__()
+        self.data = data
+
+    def _do(self, problem, n_samples, **kwargs):
+        hi = int(problem.xu[0]) + 1
+        X = np.random.randint(0, hi, size=(n_samples, problem.n_var)).astype(float)
+        seeds = [
+            depot_only_chrom(self.data),
+            np.ones(problem.n_var, dtype=int),  # all-depot
+            uncoord_chrom(self.data),
+        ]
+        for k, s in enumerate(seeds):
+            if k < n_samples:
+                X[k] = s.astype(float)
+        return X
+
+
+# --- 3b. PARETO-FRONT METRICS ---
+def reference_point(fronts, margin=0.10):
+    """Shared HV reference point for a scenario: per-axis worst over the pooled
+    archive of all seeds' fronts, inflated by `margin`. Held constant across
+    seeds so HV values are directly comparable. Returns None if no points.
+    """
+    pooled = np.vstack([F for F in fronts if F is not None and len(F) > 0])
+    if pooled.size == 0:
+        return None
+    nadir = pooled.max(axis=0)
+    span = pooled.max(axis=0) - pooled.min(axis=0)
+    span[span == 0] = 1.0  # avoid zero-margin on a degenerate axis
+    return nadir + margin * span
+
+
+def hv_of(points, ref):
+    """Hypervolume of a 2-D objective set against ref. 0.0 if empty/None."""
+    if points is None or len(points) == 0 or ref is None:
+        return 0.0
+    return float(Hypervolume(ref_point=ref).do(np.asarray(points)))
+
+
+def heuristic_domination_gap(front, heur_point, ref):
+    """Claim-1 number: HV lost when a heuristic point is added to the NSGA-II
+    front. A positive gap means the front dominates territory the heuristic
+    does not reach. Returns (hv_front, hv_with_heur, gap).
+    """
+    hv_front = hv_of(front, ref)
+    combined = np.vstack([front, np.asarray(heur_point).reshape(1, -1)])
+    hv_comb = hv_of(combined, ref)
+    return hv_front, hv_comb, hv_front - hv_comb
+
+
 # --- 4. PLOTTING ---
 def plot_pareto(case_id, fronts, do_res, do_feas, un_res, un_feas, out_path):
     """Multi-population Pareto fronts + heuristic baseline markers."""
     fig, ax = plt.subplots(figsize=(3.8, 3.0))
     colors = plt.get_cmap("viridis")(np.linspace(0, 0.8, len(fronts)))
-    for (pop, F_pts), c in zip(fronts, colors):
+    for (lbl, F_pts), c in zip(fronts, colors):
         if F_pts is None or len(F_pts) == 0:
             continue
         F_pts = F_pts[np.argsort(F_pts[:, 0])]
@@ -347,7 +434,7 @@ def plot_pareto(case_id, fronts, do_res, do_feas, un_res, un_feas, out_path):
             markersize=3,
             linewidth=1.0,
             color=c,
-            label=f"NSGA-II P:{pop}",
+            label=f"NSGA-II ({lbl})",
         )
     ax.plot(
         do_res["cost"],
@@ -426,7 +513,7 @@ def plot_fulfilment(case_id, results, out_path):
         ax.text(
             i,
             101.5,
-            f"{delivered:.0f}%",
+            f"{delivered:.0f}% met",
             ha="center",
             fontsize=6,
             fontweight="bold",
@@ -464,71 +551,83 @@ def plot_fulfilment(case_id, results, out_path):
     plt.close(fig)
 
 
-def plot_charger_utilisation(case_id, data, res, out_path, top_n=5):
+def plot_charger_utilisation(case_id, data, uncoord_res, proposed_res, out_path):
     """Heatmap of public charger utilisation through the working day
-    (9am-6pm), showing only the top_n most-utilised stations. Cells are
-    coloured by busy level and annotated with the connector count:
-    0 = Available, 1 = Partially used, 2+ = Fully occupied / queued.
-    Uses conn_occ from the simulated solution.
+    (9am-6pm) for ALL public stations, comparing the Uncoordinated baseline
+    against the Proposed (NSGA-II) method. Each row is a station; cells are
+    coloured by occupancy level relative to connector capacity:
+        0          -> Available
+        1..cap-1   -> Partially used
+        >= cap     -> Fully utilised
+    The two strategies are stacked as separate panels sharing the time axis.
     """
     dt = data["dt"]
+    F = data["F"]
+    n_conn = data["stations"][0]["n_conn"]
     # 9am = slot 36, 6pm = slot 72 (T=96 at 15-min slots from midnight)
     s0, s1 = int(9 / dt), int(18 / dt)
-    occ = res["conn_occ"][:, s0:s1]  # (F, window)
-    n_conn = data["stations"][0]["n_conn"]
-
-    # Keep only the top_n most-utilised stations (by total busy slots)
-    usage = occ.sum(axis=1)
-    keep = np.argsort(usage)[::-1][:top_n]
-    keep = keep[usage[keep] > 0]  # drop entirely-idle stations
-    if len(keep) == 0:
-        keep = np.argsort(usage)[::-1][:1]  # fallback: show one row
-    occ_top = occ[keep]
-
-    # 3-level categorical: 0 = available, 1 = partial, 2 = full (>= cap)
-    level = np.clip(occ_top, 0, n_conn).astype(int)
-    level[occ_top >= n_conn] = n_conn  # cap-and-over both map to "full"
 
     cmap = mcolors.ListedColormap(["#eaecee", "#f0b429", "#cb4d28"])
-    fig, ax = plt.subplots(figsize=(6.0, 0.5 * len(keep) + 1.4))
-    ax.imshow(level, aspect="auto", cmap=cmap, vmin=0, vmax=2, interpolation="nearest")
 
+    def level_grid(res):
+        occ = res["conn_occ"][:, s0:s1]  # (F, window), all stations
+        lvl = np.clip(occ, 0, n_conn).astype(int)
+        lvl[occ >= n_conn] = n_conn  # cap-and-over both map to "full"
+        return lvl
+
+    grids = [
+        ("Uncoordinated", level_grid(uncoord_res)),
+        ("Proposed (NSGA-II)", level_grid(proposed_res)),
+    ]
+
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(6.0, (0.32 * F + 0.9) * 2),
+        sharex=True,
+        constrained_layout=True,
+    )
     hours = list(range(9, 19))
     xticks = [(h / dt) - s0 for h in hours]
-    ax.set_xticks(xticks)
-    ax.set_xticklabels([f"{h}:00" for h in hours], fontsize=6, rotation=45)
-    ax.set_yticks(range(len(keep)))
-    ax.set_yticklabels([f"S{f}" for f in keep], fontsize=6)
-    ax.set_xlabel("Time of day")
-    ax.set_ylabel("Public station")
-    ax.set_title(f"Public Charger Utilisation: {case_id}", fontweight="bold")
-    ax.legend(
+
+    for ax, (label, grid) in zip(axes, grids):
+        ax.imshow(
+            grid, aspect="auto", cmap=cmap, vmin=0, vmax=2, interpolation="nearest"
+        )
+        ax.set_yticks(range(F))
+        ax.set_yticklabels([f"S{f + 1}" for f in range(F)], fontsize=6)
+        ax.set_ylabel("Public station", fontsize=7)
+        ax.set_title(label, fontsize=8, fontweight="bold")
+
+    axes[-1].set_xticks(xticks)
+    axes[-1].set_xticklabels([f"{h}:00" for h in hours], fontsize=6, rotation=45)
+    axes[-1].set_xlabel("Time of day")
+
+    fig.suptitle(f"Public Charger Utilisation: {case_id}", fontweight="bold")
+    fig.legend(
         handles=[
             mpatches.Patch(color="#eaecee", label="Available"),
             mpatches.Patch(color="#f0b429", label="Partially used"),
             mpatches.Patch(color="#cb4d28", label="Fully utilised"),
         ],
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.28),
+        loc="lower center",
+        bbox_to_anchor=(0.5, -0.04),
         ncol=3,
         frameon=False,
-        fontsize=6,
+        fontsize=7,
     )
-    fig.tight_layout()
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
 
 def run_comparison_sim():
     scenarios = [[45, 15, 15], [60, 25, 20], [90, 30, 25]]
-    pop_sizes = [150, 200, 250]
-    alpha = 0.75
+    alpha = 0.70  # single stress level; change manually to inspect others
+    # NOTE: full (alpha, beta) Operational Stress Day sweep is future work.
     base_dir = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "simulation_results"
     )
-    plt.rcParams.update(
-        {"font.size": 7, "font.family": "helvetica", "axes.linewidth": 0.8}
-    )
+    plt.rcParams.update({"font.size": 7, "font.family": "serif", "axes.linewidth": 0.8})
 
     for N, F, M in scenarios:
         case_id = f"N{N}_F{F}_M{M}"
@@ -562,19 +661,77 @@ def run_comparison_sim():
             f"feas(p/e)={un_feas} conn_oversub={un_conn}"
         )
 
-        # NSGA-II at each population size
+        # NSGA-II: multiple independent seeds at a single population size.
+        # Seed-to-seed variance is the meaningful axis for a thesis (report
+        # HV mean +/- std), not the population sweep used in the demo.
         n_gen = 300 if N == 90 else 200
-        fronts = []
-        best = None
-        for pop in pop_sizes:
-            print(f"  NSGA-II pop={pop}, gen={n_gen}...")
-            res = minimize(
-                problem, NSGA2(pop_size=pop), ("n_gen", n_gen), seed=1, verbose=False
-            )
-            fronts.append((pop, res.F))
-            if pop == pop_sizes[-1] and res.F is not None and len(res.F) > 0:
-                best = res
+        pop_size = 200
+        seeds = list(range(5))
 
+        seed_fronts = []  # res.F per seed
+        seed_results = []  # full res objects per seed
+        for sd in seeds:
+            print(f"  NSGA-II pop={pop_size}, gen={n_gen}, seed={sd}...")
+            res = minimize(
+                problem,
+                NSGA2(pop_size=pop_size, sampling=WarmStartSampling(data)),
+                ("n_gen", n_gen),
+                seed=sd,
+                verbose=False,
+            )
+            seed_fronts.append(res.F)
+            seed_results.append(res)
+
+        # Shared reference point across seeds (pooled nadir + 10% margin)
+        ref = reference_point(seed_fronts)
+        hvs = np.array([hv_of(F, ref) for F in seed_fronts])
+        valid = hvs > 0
+        if not valid.any():
+            print("  No feasible front on any seed; skipping plots.")
+            continue
+        hv_mean, hv_std = float(hvs[valid].mean()), float(hvs[valid].std())
+
+        # Representative seed = the one whose HV is closest to the mean
+        rep_idx = int(np.argmin(np.abs(hvs - hv_mean)))
+        best = seed_results[rep_idx]
+        rep_front = seed_fronts[rep_idx]
+        print(
+            f"  HV across {valid.sum()} valid seeds: "
+            f"mean={hv_mean:.1f} std={hv_std:.1f} (rep seed={seeds[rep_idx]})"
+        )
+
+        # Claim-1 domination gaps for each heuristic, on the representative seed
+        do_pt = [do_r["cost"], do_r["shortfall"]]
+        un_pt = [un_r["cost"], un_r["shortfall"]]
+        _, _, gap_do = heuristic_domination_gap(rep_front, do_pt, ref)
+        _, _, gap_un = heuristic_domination_gap(rep_front, un_pt, ref)
+        print(
+            f"  Domination gap vs Depot-Only={gap_do:.1f}  "
+            f"vs Uncoordinated={gap_un:.1f}"
+        )
+
+        # Write per-scenario metrics CSV
+        with open(os.path.join(case_dir, "metrics.csv"), "w", newline="") as fcsv:
+            w = csv.writer(fcsv)
+            w.writerow(["metric", "value"])
+            w.writerow(["scenario", case_id])
+            w.writerow(["alpha", alpha])
+            w.writerow(["pop_size", pop_size])
+            w.writerow(["n_gen", n_gen])
+            w.writerow(["n_seeds", len(seeds)])
+            w.writerow(["n_valid_seeds", int(valid.sum())])
+            w.writerow(["hv_mean", hv_mean])
+            w.writerow(["hv_std", hv_std])
+            w.writerow(["ref_cost", ref[0]])
+            w.writerow(["ref_shortfall", ref[1]])
+            w.writerow(["depot_only_feasible", do_feas])
+            w.writerow(["uncoord_feasible_display", un_feas_display])
+            w.writerow(["domination_gap_depot_only", gap_do])
+            w.writerow(["domination_gap_uncoord", gap_un])
+            w.writerow(["per_seed_hv", ";".join(f"{h:.2f}" for h in hvs)])
+
+        # Plot the representative seed's front (not a population overlay)
+        fronts = [(f"seed {seeds[rep_idx]}", rep_front)]
         plot_pareto(
             case_id,
             fronts,
@@ -584,18 +741,19 @@ def run_comparison_sim():
             un_feas_display,
             os.path.join(case_dir, "pareto.png"),
         )
-
-        if best is None:
-            print("  No feasible front; skipping fulfilment plot.")
-            continue
-
-        # Knee point of largest-population front for the fulfilment chart
         Fb = best.F
         norm_F = (Fb - Fb.min(axis=0)) / (Fb.max(axis=0) - Fb.min(axis=0) + 1e-6)
-        knee = int(ASF().do(norm_F, 1 / np.array([0.5, 0.5])).argmin())
+        # Reliability-weighted point: 80% weight on shortfall (obj 1), 20% on
+        # cost (obj 0). ASF uses 1/weight, so the larger shortfall weight pulls
+        # the selected solution toward the high-fulfilment end of the front,
+        # reflecting an operator who prioritises service over marginal cost.
+        rel_weights = np.array([0.2, 0.8])
+        knee = int(ASF().do(norm_F, 1 / rel_weights).argmin())
         nsga_r = problem.simulate(best.X[knee])
         print(
-            f"  NSGA-II knee: cost=${nsga_r['cost']:.0f} short={nsga_r['shortfall']:.0f} "
+            f"  NSGA-II (rel-weighted): cost=${nsga_r['cost']:.0f} "
+            f"short={nsga_r['shortfall']:.0f} "
+            f"fulfil={100*(nsga_r['e_dep']+nsga_r['e_pub'])/demand:.0f}% "
             f"depot={100*nsga_r['e_dep']/demand:.0f}% L2={100*nsga_r['e_pub']/demand:.0f}%"
         )
 
@@ -610,7 +768,11 @@ def run_comparison_sim():
         )
 
         plot_charger_utilisation(
-            case_id, data, nsga_r, os.path.join(case_dir, "charger_utilisation.png")
+            case_id,
+            data,
+            un_r,
+            nsga_r,
+            os.path.join(case_dir, "charger_utilisation.png"),
         )
 
 

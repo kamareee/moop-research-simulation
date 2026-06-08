@@ -162,6 +162,10 @@ class ChargingProblem(ElementwiseProblem):
         cost, total_shortfall = 0, 0
         load, evses = np.zeros(d["T"]), np.zeros(d["T"])
         conn_occ = np.zeros((d["F"], d["T"]))
+        # Attempted occupancy: what the schedule *would* claim regardless of
+        # whether the station is available at that time. Used for plotting to
+        # expose availability violations by the uncoordinated baseline.
+        conn_occ_attempted = np.zeros((d["F"], d["T"]))
         e_depot, e_L2 = 0, 0  # charged-in energy (debug)
         e_dep_trips, e_pub_trips = 0, 0  # trip-delivered energy by source
 
@@ -200,6 +204,18 @@ class ChargingProblem(ElementwiseProblem):
                     net_min = ((end - start) * d["dt"] * 60) - v["detour"][f_idx] - wait
                     cost += d["c_d_t"] * (v["detour"][f_idx] + wait)
 
+                    # Attempted-occupancy footprint (used for reporting; recorded
+                    # whether or not the station is actually available).
+                    slot_min = d["dt"] * 60
+                    occ_start_att = min(
+                        d["T"], start + int(np.ceil(v["detour"][f_idx] / slot_min))
+                    )
+                    if net_min > 0:
+                        occ_end_att = min(
+                            d["T"], occ_start_att + int(np.ceil(net_min / slot_min))
+                        )
+                        conn_occ_attempted[f_idx, occ_start_att:occ_end_att] += 1
+
                     if net_min > 0 and is_avail:
                         energy_gained = (
                             min(st["power"] * (net_min / 60), v["bat_max"] - soc[i])
@@ -211,14 +227,10 @@ class ChargingProblem(ElementwiseProblem):
                         b_pub[i] += energy_gained
 
                         # Track connector occupancy (reporting-only)
-                        slot_min = d["dt"] * 60
-                        occ_start = min(
-                            d["T"], start + int(np.ceil(v["detour"][f_idx] / slot_min))
-                        )
                         occ_end = min(
-                            d["T"], occ_start + int(np.ceil(net_min / slot_min))
+                            d["T"], occ_start_att + int(np.ceil(net_min / slot_min))
                         )
-                        conn_occ[f_idx, occ_start:occ_end] += 1
+                        conn_occ[f_idx, occ_start_att:occ_end] += 1
 
                 # Trip after this dwell (if any)
                 if j < len(v["e_trip"]):
@@ -250,6 +262,7 @@ class ChargingProblem(ElementwiseProblem):
             "net_load": load,
             "evses": evses,
             "conn_occ": conn_occ,
+            "conn_occ_attempted": conn_occ_attempted,
             "e_depot": e_depot,
             "e_L2": e_L2,
             "e_dep": e_dep_trips,
@@ -426,7 +439,7 @@ def plot_fulfilment(case_id, results, out_path):
         ax.text(
             i,
             101.5,
-            f"{delivered:.0f}%",
+            f"{delivered:.0f}% met",
             ha="center",
             fontsize=6,
             fontweight="bold",
@@ -464,55 +477,111 @@ def plot_fulfilment(case_id, results, out_path):
     plt.close(fig)
 
 
-def plot_charger_utilisation(case_id, data, res, out_path, top_n=5):
-    """Heatmap of public charger utilisation through the working day
-    (9am-6pm), showing only the top_n most-utilised stations. Cells are
-    coloured by busy level and annotated with the connector count:
-    0 = Available, 1 = Partially used, 2+ = Fully occupied / queued.
-    Uses conn_occ from the simulated solution.
+def plot_charger_utilisation(case_id, data, basic_res, proposed_res, out_path):
+    """Parallel-bars view of public charger utilisation over the day.
+
+    For each public station, two horizontal bars are drawn:
+      - blue:  Basic case      (uncoordinated baseline)
+      - red:   Proposed method (NSGA-II)
+    Bars are drawn from *attempted* occupancy, so any time the basic case
+    tries to use a station that is offline at that time, the blue bar will
+    overlap a grey availability-blackout band -- making the violation
+    visible. The proposed method should keep its bars clear of grey bands.
+    All public stations are shown; the time axis covers 06:00 -> 00:00.
     """
     dt = data["dt"]
-    # 9am = slot 36, 6pm = slot 72 (T=96 at 15-min slots from midnight)
-    s0, s1 = int(9 / dt), int(18 / dt)
-    occ = res["conn_occ"][:, s0:s1]  # (F, window)
-    n_conn = data["stations"][0]["n_conn"]
+    F = data["F"]
+    pub_avail = data["pub_availability"]  # (T, F): 1 = available, 0 = offline
 
-    # Keep only the top_n most-utilised stations (by total busy slots)
-    usage = occ.sum(axis=1)
-    keep = np.argsort(usage)[::-1][:top_n]
-    keep = keep[usage[keep] > 0]  # drop entirely-idle stations
-    if len(keep) == 0:
-        keep = np.argsort(usage)[::-1][:1]  # fallback: show one row
-    occ_top = occ[keep]
+    # Active operating window: 06:00 -> 24:00 (slot indices 24..96 at dt=0.25)
+    t0_slot, t1_slot = int(6 / dt), int(24 / dt)
 
-    # 3-level categorical: 0 = available, 1 = partial, 2 = full (>= cap)
-    level = np.clip(occ_top, 0, n_conn).astype(int)
-    level[occ_top >= n_conn] = n_conn  # cap-and-over both map to "full"
+    def runs(mask):
+        """Convert a boolean 1-D mask into (start_h, end_h) intervals in hours."""
+        spans, t = [], 0
+        while t < len(mask):
+            if mask[t]:
+                s = t
+                while t < len(mask) and mask[t]:
+                    t += 1
+                spans.append((s * dt, t * dt))
+            else:
+                t += 1
+        return spans
 
-    cmap = mcolors.ListedColormap(["#eaecee", "#f0b429", "#cb4d28"])
-    fig, ax = plt.subplots(figsize=(6.0, 0.5 * len(keep) + 1.4))
-    ax.imshow(level, aspect="auto", cmap=cmap, vmin=0, vmax=2, interpolation="nearest")
+    def busy_intervals(res):
+        """Per-station list of busy (start_h, end_h) intervals, from attempted
+        occupancy if present, else from successful occupancy."""
+        occ = res.get("conn_occ_attempted", res["conn_occ"])
+        return [runs(occ[f] > 0) for f in range(F)]
 
-    hours = list(range(9, 19))
-    xticks = [(h / dt) - s0 for h in hours]
-    ax.set_xticks(xticks)
-    ax.set_xticklabels([f"{h}:00" for h in hours], fontsize=6, rotation=45)
-    ax.set_yticks(range(len(keep)))
-    ax.set_yticklabels([f"S{f}" for f in keep], fontsize=6)
-    ax.set_xlabel("Time of day")
+    basic_spans = busy_intervals(basic_res)
+    prop_spans = busy_intervals(proposed_res)
+
+    blue, red = "#1f4ed8", "#d11f1f"  # match sample: basic = blue, proposed = red
+    grey = "#d6dadf"  # availability-blackout shading
+    bar_h = 0.32
+    offset = 0.22  # vertical offset between the two bars within a station row
+
+    fig, ax = plt.subplots(figsize=(6.0, 0.45 * F + 1.8))
+
+    for f in range(F):
+        y = f + 1  # ascending: station 1 at bottom, station F at top (matches sample)
+        # Availability blackout: shade slots where station f is offline
+        offline = pub_avail[:, f] < 0.5
+        for s, e in runs(offline):
+            ax.barh(
+                y, e - s, left=s, height=0.82, color=grey, edgecolor="none", zorder=1
+            )
+        # Basic case (blue) -- drawn slightly above centre
+        for s, e in basic_spans[f]:
+            ax.barh(
+                y + offset,
+                e - s,
+                left=s,
+                height=bar_h,
+                color=blue,
+                edgecolor=blue,
+                zorder=3,
+            )
+        # Proposed method (red) -- drawn slightly below centre
+        for s, e in prop_spans[f]:
+            ax.barh(
+                y - offset,
+                e - s,
+                left=s,
+                height=bar_h,
+                color=red,
+                edgecolor=red,
+                zorder=3,
+            )
+
+    # X-axis: 06:00 -> 00:00, ticks every 2 hours
+    ax.set_xlim(t0_slot * dt, t1_slot * dt)
+    xt = list(range(6, 25, 2))
+    ax.set_xticks(xt)
+    ax.set_xticklabels([f"{h % 24:02d}:00" for h in xt], fontsize=7)
+    ax.set_xlabel("Time (hh:mm)")
+
+    # Y-axis: one row per public station
+    ax.set_ylim(0.4, F + 0.6)
+    ax.set_yticks(range(1, F + 1))
+    ax.set_yticklabels([f"S{i + 1}" for i in range(F)], fontsize=7)
     ax.set_ylabel("Public station")
+
     ax.set_title(f"Public Charger Utilisation: {case_id}", fontweight="bold")
+    ax.grid(True, axis="x", alpha=0.25, linewidth=0.5, zorder=0)
+    ax.set_axisbelow(True)
     ax.legend(
         handles=[
-            mpatches.Patch(color="#eaecee", label="Available"),
-            mpatches.Patch(color="#f0b429", label="Partially used"),
-            mpatches.Patch(color="#cb4d28", label="Fully utilised"),
+            mpatches.Patch(color=blue, label="Basic case"),
+            mpatches.Patch(color=red, label="Proposed method"),
+            mpatches.Patch(color=grey, label="Station offline"),
         ],
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.28),
+        loc="lower left",
+        fontsize=7,
+        frameon=True,
         ncol=3,
-        frameon=False,
-        fontsize=6,
     )
     fig.tight_layout()
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
@@ -522,13 +591,11 @@ def plot_charger_utilisation(case_id, data, res, out_path, top_n=5):
 def run_comparison_sim():
     scenarios = [[45, 15, 15], [60, 25, 20], [90, 30, 25]]
     pop_sizes = [150, 200, 250]
-    alpha = 0.75
+    alpha = 0.70
     base_dir = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "simulation_results"
     )
-    plt.rcParams.update(
-        {"font.size": 7, "font.family": "helvetica", "axes.linewidth": 0.8}
-    )
+    plt.rcParams.update({"font.size": 7, "font.family": "serif", "axes.linewidth": 0.8})
 
     for N, F, M in scenarios:
         case_id = f"N{N}_F{F}_M{M}"
@@ -610,7 +677,11 @@ def run_comparison_sim():
         )
 
         plot_charger_utilisation(
-            case_id, data, nsga_r, os.path.join(case_dir, "charger_utilisation.png")
+            case_id,
+            data,
+            un_r,
+            nsga_r,
+            os.path.join(case_dir, "charger_utilisation.png"),
         )
 
 
