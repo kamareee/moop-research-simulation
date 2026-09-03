@@ -553,17 +553,18 @@ def plot_fulfilment(case_id, results, out_path):
 
 def plot_charger_utilisation(case_id, data, uncoord_res, proposed_res, out_path):
     """Per-station horizontal stacked bars of public charger utilisation
-    through the working day (9am-6pm), for ALL public stations, comparing the
-    Uncoordinated baseline against the Proposed (NSGA-II) method.
+    through the working day (9am-6pm) for the Proposed (NSGA-II) method.
 
-    For each station two bars are drawn together (uncoordinated on top,
-    proposed below, labelled S#-U / S#-P). Each bar stacks the hours the
-    station spent in each occupancy state, relative to connector capacity,
-    so the two bars per station each sum to the 9-hour window:
+    One thin bar per public station, stacking the hours the station spent in
+    each occupancy state relative to connector capacity, so each bar sums to
+    the 9-hour window:
         0          -> Available
         1..cap-1   -> Partially used
         >= cap     -> Fully utilised
+    (uncoord_res is accepted for call-site compatibility but no longer shown.)
     """
+    del uncoord_res  # uncoordinated baseline intentionally omitted
+
     dt = data["dt"]
     F = data["F"]
     n_conn = data["stations"][0]["n_conn"]
@@ -572,49 +573,35 @@ def plot_charger_utilisation(case_id, data, uncoord_res, proposed_res, out_path)
 
     colors = ["#eaecee", "#f0b429", "#cb4d28"]  # available / partial / full
 
-    def state_hours(res):
-        """Hours per station spent in each of the three occupancy states."""
-        occ = res["conn_occ"][:, s0:s1]  # (F, window), all stations
-        avail = (occ == 0).sum(axis=1) * dt
-        partial = ((occ >= 1) & (occ < n_conn)).sum(axis=1) * dt
-        full = (occ >= n_conn).sum(axis=1) * dt
-        return np.column_stack([avail, partial, full])  # (F, 3)
+    occ = proposed_res["conn_occ"][:, s0:s1]  # (F, window)
+    avail = (occ == 0).sum(axis=1) * dt
+    partial = ((occ >= 1) & (occ < n_conn)).sum(axis=1) * dt
+    full = (occ >= n_conn).sum(axis=1) * dt
+    states = np.column_stack([avail, partial, full])  # (F, 3)
 
-    unc_h = state_hours(uncoord_res)
-    prop_h = state_hours(proposed_res)
+    bar_h = 0.5  # thin bar; stations packed close together
+    gap = 0.5  # vertical gap between station bars
+    step = bar_h + gap
+    y = np.arange(F) * step + gap
 
-    bar_h = 0.4  # bar thickness
-    group_gap = 0.5  # vertical gap between station groups
-    group_span = 2 * bar_h + group_gap
+    fig, ax = plt.subplots(figsize=(6.0, 0.32 * F + 1.2))
 
-    fig, ax = plt.subplots(figsize=(6.0, 0.55 * F + 1.4))
-
-    yticks, yticklabels = [], []
     for f in range(F):
-        base = f * group_span
-        # Uncoordinated on top, proposed below
-        y_unc = base + group_gap + bar_h + bar_h / 2  # upper row centre
-        y_prop = base + group_gap + bar_h / 2  # lower row centre
-        for y, row in ((y_unc, unc_h[f]), (y_prop, prop_h[f])):
-            left = 0.0
-            for val, c in zip(row, colors):
-                ax.barh(
-                    y, val, left=left, height=bar_h,
-                    color=c, edgecolor="#5b5b5b", linewidth=0.4, zorder=3,
-                )
-                left += val
-        yticks.append(y_unc)
-        yticklabels.append(f"S{f + 1}-U")
-        yticks.append(y_prop)
-        yticklabels.append(f"S{f + 1}-P")
+        left = 0.0
+        for val, c in zip(states[f], colors):
+            ax.barh(
+                y[f], val, left=left, height=bar_h,
+                color=c, edgecolor="#5b5b5b", linewidth=0.4, zorder=3,
+            )
+            left += val
 
     ax.set_xlim(0, (s1 - s0) * dt)
-    ax.set_ylim(0, F * group_span)
+    ax.set_ylim(0, F * step + gap)
     ax.set_xlabel("Hours in state (09:00-18:00)")
-    ax.set_yticks(yticks)
-    ax.set_yticklabels(yticklabels, fontsize=5)
-    ax.set_ylabel("Public station  (U = Uncoordinated, P = Proposed NSGA-II)")
-    ax.set_title(f"Public Charger Utilisation: {case_id}", fontweight="bold")
+    ax.set_yticks(y)
+    ax.set_yticklabels([f"S{f + 1}" for f in range(F)], fontsize=6)
+    ax.set_ylabel("Public station")
+    ax.set_title(f"Public Charger Utilisation (Proposed): {case_id}", fontweight="bold")
     ax.grid(True, axis="x", alpha=0.25, linewidth=0.5, zorder=0)
     ax.set_axisbelow(True)
     ax.legend(
@@ -640,6 +627,9 @@ def run_comparison_sim():
     )
     plt.rcParams.update({"font.size": 7, "font.family": "serif", "axes.linewidth": 0.8})
 
+    pop_size = 200
+    seeds = list(range(5))
+
     for N, F, M in scenarios:
         case_id = f"N{N}_F{F}_M{M}"
         case_dir = os.path.join(base_dir, case_id)
@@ -654,7 +644,7 @@ def run_comparison_sim():
             f"Initial SoC: {sum(v['soc_init'] * v['bat_max'] for v in data['fleet']):.1f} kWh"
         )
 
-        # Heuristic baselines
+        # Heuristic baselines (independent of NSGA-II generation budget)
         do_r = problem.simulate(depot_only_chrom(data))
         do_feas = is_feasible(data, do_r)
         print(
@@ -672,119 +662,147 @@ def run_comparison_sim():
             f"feas(p/e)={un_feas} conn_oversub={un_conn}"
         )
 
-        # NSGA-II: multiple independent seeds at a single population size.
-        # Seed-to-seed variance is the meaningful axis for a thesis (report
-        # HV mean +/- std), not the population sweep used in the demo.
-        n_gen = 300 if N == 90 else 200
-        pop_size = 200
-        seeds = list(range(5))
+        # Generation budgets per scenario. All cases run at 500; N=90 also runs
+        # at 800 to show the front under a larger budget (two fronts overlaid).
+        gen_budgets = [500, 800] if N == 90 else [500]
+        multi = len(gen_budgets) > 1  # suffix output filenames only when >1 front
 
-        seed_fronts = []  # res.F per seed
-        seed_results = []  # full res objects per seed
-        for sd in seeds:
-            print(f"  NSGA-II pop={pop_size}, gen={n_gen}, seed={sd}...")
-            res = minimize(
-                problem,
-                NSGA2(pop_size=pop_size, sampling=WarmStartSampling(data)),
-                ("n_gen", n_gen),
-                seed=sd,
-                verbose=False,
+        # NSGA-II: multiple independent seeds at a single population size, run
+        # once per generation budget. Seed-to-seed variance is the meaningful
+        # axis for a thesis (report HV mean +/- std).
+        pareto_fronts = []  # (label, front) per budget, for the overlaid Pareto plot
+        csv_rows = []  # one metrics block per budget
+
+        for n_gen in gen_budgets:
+            seed_fronts = []  # res.F per seed
+            seed_results = []  # full res objects per seed
+            for sd in seeds:
+                print(f"  NSGA-II pop={pop_size}, gen={n_gen}, seed={sd}...")
+                res = minimize(
+                    problem,
+                    NSGA2(pop_size=pop_size, sampling=WarmStartSampling(data)),
+                    ("n_gen", n_gen),
+                    seed=sd,
+                    verbose=False,
+                )
+                seed_fronts.append(res.F)
+                seed_results.append(res)
+
+            # Shared reference point across seeds (pooled nadir + 10% margin)
+            ref = reference_point(seed_fronts)
+            hvs = np.array([hv_of(F, ref) for F in seed_fronts])
+            valid = hvs > 0
+            if not valid.any():
+                print(f"  gen={n_gen}: no feasible front on any seed; skipping.")
+                continue
+            hv_mean, hv_std = float(hvs[valid].mean()), float(hvs[valid].std())
+
+            # Representative seed = the one whose HV is closest to the mean
+            rep_idx = int(np.argmin(np.abs(hvs - hv_mean)))
+            best = seed_results[rep_idx]
+            rep_front = seed_fronts[rep_idx]
+            print(
+                f"  gen={n_gen}: HV across {valid.sum()} valid seeds: "
+                f"mean={hv_mean:.1f} std={hv_std:.1f} (rep seed={seeds[rep_idx]})"
             )
-            seed_fronts.append(res.F)
-            seed_results.append(res)
 
-        # Shared reference point across seeds (pooled nadir + 10% margin)
-        ref = reference_point(seed_fronts)
-        hvs = np.array([hv_of(F, ref) for F in seed_fronts])
-        valid = hvs > 0
-        if not valid.any():
-            print("  No feasible front on any seed; skipping plots.")
+            # Collect this budget's representative front for the Pareto overlay
+            label = f"NSGA-II gen {n_gen}" if multi else f"seed {seeds[rep_idx]}"
+            pareto_fronts.append((label, rep_front))
+
+            # Claim-1 domination gaps for each heuristic, on the representative seed
+            do_pt = [do_r["cost"], do_r["shortfall"]]
+            un_pt = [un_r["cost"], un_r["shortfall"]]
+            _, _, gap_do = heuristic_domination_gap(rep_front, do_pt, ref)
+            _, _, gap_un = heuristic_domination_gap(rep_front, un_pt, ref)
+            print(
+                f"  gen={n_gen}: domination gap vs Depot-Only={gap_do:.1f}  "
+                f"vs Uncoordinated={gap_un:.1f}"
+            )
+
+            csv_rows.append(
+                {
+                    "n_gen": n_gen,
+                    "pop_size": pop_size,
+                    "n_seeds": len(seeds),
+                    "n_valid_seeds": int(valid.sum()),
+                    "hv_mean": hv_mean,
+                    "hv_std": hv_std,
+                    "ref_cost": ref[0],
+                    "ref_shortfall": ref[1],
+                    "domination_gap_depot_only": gap_do,
+                    "domination_gap_uncoord": gap_un,
+                    "per_seed_hv": ";".join(f"{h:.2f}" for h in hvs),
+                }
+            )
+
+            # Knee point of this budget's representative front.
+            Fb = best.F
+            norm_F = (Fb - Fb.min(axis=0)) / (Fb.max(axis=0) - Fb.min(axis=0) + 1e-6)
+            # Reliability-weighted point: 80% weight on shortfall (obj 1), 20% on
+            # cost (obj 0). ASF uses 1/weight, so the larger shortfall weight pulls
+            # the selected solution toward the high-fulfilment end of the front,
+            # reflecting an operator who prioritises service over marginal cost.
+            rel_weights = np.array([0.2, 0.8])
+            knee = int(ASF().do(norm_F, 1 / rel_weights).argmin())
+            nsga_r = problem.simulate(best.X[knee])
+            print(
+                f"  gen={n_gen}: NSGA-II (rel-weighted): cost=${nsga_r['cost']:.0f} "
+                f"short={nsga_r['shortfall']:.0f} "
+                f"fulfil={100*(nsga_r['e_dep']+nsga_r['e_pub'])/demand:.0f}% "
+                f"depot={100*nsga_r['e_dep']/demand:.0f}% L2={100*nsga_r['e_pub']/demand:.0f}%"
+            )
+
+            # Per-budget fulfilment + utilisation figures. Suffix the filename
+            # with the generation budget only when more than one front exists.
+            suffix = f"_gen{n_gen}" if multi else ""
+            plot_fulfilment(
+                case_id,
+                [
+                    ("Depot-Only", do_r, do_feas, demand),
+                    ("Uncoord.", un_r, un_feas_display, demand),
+                    ("NSGA-II", nsga_r, True, demand),
+                ],
+                os.path.join(case_dir, f"fulfillment{suffix}.png"),
+            )
+            plot_charger_utilisation(
+                case_id,
+                data,
+                un_r,
+                nsga_r,
+                os.path.join(case_dir, f"charger_utilisation{suffix}.png"),
+            )
+
+        if not pareto_fronts:
+            print("  No feasible front on any budget; skipping Pareto plot.")
             continue
-        hv_mean, hv_std = float(hvs[valid].mean()), float(hvs[valid].std())
 
-        # Representative seed = the one whose HV is closest to the mean
-        rep_idx = int(np.argmin(np.abs(hvs - hv_mean)))
-        best = seed_results[rep_idx]
-        rep_front = seed_fronts[rep_idx]
-        print(
-            f"  HV across {valid.sum()} valid seeds: "
-            f"mean={hv_mean:.1f} std={hv_std:.1f} (rep seed={seeds[rep_idx]})"
-        )
-
-        # Claim-1 domination gaps for each heuristic, on the representative seed
-        do_pt = [do_r["cost"], do_r["shortfall"]]
-        un_pt = [un_r["cost"], un_r["shortfall"]]
-        _, _, gap_do = heuristic_domination_gap(rep_front, do_pt, ref)
-        _, _, gap_un = heuristic_domination_gap(rep_front, un_pt, ref)
-        print(
-            f"  Domination gap vs Depot-Only={gap_do:.1f}  "
-            f"vs Uncoordinated={gap_un:.1f}"
-        )
-
-        # Write per-scenario metrics CSV
-        with open(os.path.join(case_dir, "metrics.csv"), "w", newline="") as fcsv:
-            w = csv.writer(fcsv)
-            w.writerow(["metric", "value"])
-            w.writerow(["scenario", case_id])
-            w.writerow(["alpha", alpha])
-            w.writerow(["pop_size", pop_size])
-            w.writerow(["n_gen", n_gen])
-            w.writerow(["n_seeds", len(seeds)])
-            w.writerow(["n_valid_seeds", int(valid.sum())])
-            w.writerow(["hv_mean", hv_mean])
-            w.writerow(["hv_std", hv_std])
-            w.writerow(["ref_cost", ref[0]])
-            w.writerow(["ref_shortfall", ref[1]])
-            w.writerow(["depot_only_feasible", do_feas])
-            w.writerow(["uncoord_feasible_display", un_feas_display])
-            w.writerow(["domination_gap_depot_only", gap_do])
-            w.writerow(["domination_gap_uncoord", gap_un])
-            w.writerow(["per_seed_hv", ";".join(f"{h:.2f}" for h in hvs)])
-
-        # Plot the representative seed's front (not a population overlay)
-        fronts = [(f"seed {seeds[rep_idx]}", rep_front)]
+        # Single Pareto figure overlaying all generation budgets for this case.
         plot_pareto(
             case_id,
-            fronts,
+            pareto_fronts,
             do_r,
             do_feas,
             un_r,
             un_feas_display,
             os.path.join(case_dir, "pareto.png"),
         )
-        Fb = best.F
-        norm_F = (Fb - Fb.min(axis=0)) / (Fb.max(axis=0) - Fb.min(axis=0) + 1e-6)
-        # Reliability-weighted point: 80% weight on shortfall (obj 1), 20% on
-        # cost (obj 0). ASF uses 1/weight, so the larger shortfall weight pulls
-        # the selected solution toward the high-fulfilment end of the front,
-        # reflecting an operator who prioritises service over marginal cost.
-        rel_weights = np.array([0.2, 0.8])
-        knee = int(ASF().do(norm_F, 1 / rel_weights).argmin())
-        nsga_r = problem.simulate(best.X[knee])
-        print(
-            f"  NSGA-II (rel-weighted): cost=${nsga_r['cost']:.0f} "
-            f"short={nsga_r['shortfall']:.0f} "
-            f"fulfil={100*(nsga_r['e_dep']+nsga_r['e_pub'])/demand:.0f}% "
-            f"depot={100*nsga_r['e_dep']/demand:.0f}% L2={100*nsga_r['e_pub']/demand:.0f}%"
-        )
 
-        plot_fulfilment(
-            case_id,
-            [
-                ("Depot-Only", do_r, do_feas, demand),
-                ("Uncoord.", un_r, un_feas_display, demand),
-                ("NSGA-II", nsga_r, True, demand),
-            ],
-            os.path.join(case_dir, "fulfillment.png"),
-        )
-
-        plot_charger_utilisation(
-            case_id,
-            data,
-            un_r,
-            nsga_r,
-            os.path.join(case_dir, "charger_utilisation.png"),
-        )
+        # Metrics CSV: one block per generation budget.
+        with open(os.path.join(case_dir, "metrics.csv"), "w", newline="") as fcsv:
+            w = csv.writer(fcsv)
+            w.writerow(["scenario", "alpha", "n_gen", "pop_size", "n_seeds",
+                        "n_valid_seeds", "hv_mean", "hv_std", "ref_cost",
+                        "ref_shortfall", "depot_only_feasible",
+                        "uncoord_feasible_display", "domination_gap_depot_only",
+                        "domination_gap_uncoord", "per_seed_hv"])
+            for r in csv_rows:
+                w.writerow([case_id, alpha, r["n_gen"], r["pop_size"],
+                            r["n_seeds"], r["n_valid_seeds"], r["hv_mean"],
+                            r["hv_std"], r["ref_cost"], r["ref_shortfall"],
+                            do_feas, un_feas_display,
+                            r["domination_gap_depot_only"],
+                            r["domination_gap_uncoord"], r["per_seed_hv"]])
 
 
 if __name__ == "__main__":
