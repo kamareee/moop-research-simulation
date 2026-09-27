@@ -5,6 +5,9 @@ run_ch5_thesis.py (no re-simulation, no placeholder data).
 
 Usage:
     uv run python plot_ch5_figures.py --results simulation_results_ch5 --out figures
+    # thesis revision (Sep 2026): Medium and Large only
+    uv run python plot_ch5_figures.py --results simulation_results_ch5 --out figures \
+        --cases N60_F25_M20 N90_F30_M25
 
 Writes figures/ch5_*.png at 300 DPI in the Chapter 3/4 style (no in-figure
 titles; captions live in the .tex). Also writes figures/ch5_figure_numbers.csv
@@ -29,7 +32,7 @@ C_FRONT2 = "#77AC30"  # green  — 800-generation front
 C_DO = "#D95319"      # orange — Depot-Only Greedy
 C_UN = "#7E2F8E"      # purple — Uncoordinated Immediate
 C_DEP = "#0072BD"     # depot energy
-C_PUB = "#EDB120"     # public energy
+C_PUB = "#EDB120"     # off-depot energy
 C_SHORT = "#D95319"   # shortfall
 C_AVAIL, C_PART, C_FULL = "#E6E6E6", "#EDB120", "#D95319"
 SCN = {"N45": "#0072BD", "N60": "#D95319", "N90": "#77AC30"}
@@ -134,7 +137,7 @@ def fig_fulfilment(case_id, bl, rep, out, rows):
     ax.set_ylabel("Share of trip energy demand (%)")
     ax.set_ylim(-10, 112); ax.axhline(100, color="black", ls="--", lw=1.0)
     ax.legend(handles=[mpatches.Patch(color=C_DEP, label="Depot"),
-                       mpatches.Patch(color=C_PUB, label="Public L2"),
+                       mpatches.Patch(color=C_PUB, label="Off-depot L2"),
                        mpatches.Patch(color=C_SHORT, label="Shortfall")],
               loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=3, frameon=False)
     fig.tight_layout()
@@ -155,7 +158,7 @@ def fig_utilisation(case_id, ins, rep, out, rows):
     ax.barh(y, full, left=avail + part, color=C_FULL, edgecolor="#404040", lw=0.6, height=0.72)
     ax.set_yticks(y); ax.set_yticklabels([f"S{f + 1}" for f in range(F)], fontsize=9)
     ax.set_xlim(0, (s1 - s0) * dt); ax.set_ylim(-0.6, F - 0.4)
-    ax.set_xlabel("Hours in state, 09:00–18:00"); ax.set_ylabel("Public station")
+    ax.set_xlabel("Hours in state, 09:00–18:00"); ax.set_ylabel("Off-depot station")
     ax.grid(True, axis="x", alpha=0.25, lw=0.5); ax.set_axisbelow(True)
     ax.legend(handles=[mpatches.Patch(facecolor=C_AVAIL, edgecolor="#404040", label="Available"),
                        mpatches.Patch(facecolor=C_PART, edgecolor="#404040", label="One fleet vehicle"),
@@ -239,10 +242,17 @@ def main():
     ap.add_argument("--results", default="simulation_results_ch5")
     ap.add_argument("--out", default="figures")
     ap.add_argument("--seed-fronts", action="store_true", help="also write the per-seed front overlays (not used in the chapter)")
+    ap.add_argument("--cases", nargs="+", default=None,
+                    help="restrict to these case folders, e.g. N60_F25_M20 N90_F30_M25 (default: every N*_F*_M* folder)")
     args = ap.parse_args()
     style()
     os.makedirs(args.out, exist_ok=True)
     case_ids = sorted(os.path.basename(p) for p in glob.glob(os.path.join(args.results, "N*_F*_M*")))
+    if args.cases:
+        missing = [c for c in args.cases if c not in case_ids]
+        if missing:
+            raise SystemExit(f"case folder(s) not found: {missing}")
+        case_ids = [c for c in case_ids if c in args.cases]
     cases = {c: load_case(args.results, c) for c in case_ids}
     rows = []
     for case_id, (fr, bl, ins, reps) in cases.items():
